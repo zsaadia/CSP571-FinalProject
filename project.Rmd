@@ -1,0 +1,644 @@
+---
+title: "csp571 project"
+output: html_document
+date: "2025-08-08"
+---
+
+```{r}
+#Load required libraries
+packages <- c("tidyverse", "lubridate", "quantmod", "tidyquant", 
+              "caret", "randomForest", "pROC", "PRROC", "ggplot2", "xgboost", "corrplot")
+install.packages(setdiff(packages, rownames(installed.packages())))
+lapply(packages, library, character.only = TRUE)
+```
+
+```{r}
+#Set date range
+start_date <- as.Date("1970-01-01")
+end_date <- Sys.Date()
+
+```
+
+```{r}
+#Function to download & rename series from FRED
+get_symbols <- function(ticker, label) {
+  tq_get(ticker, get = "economic.data", from = start_date, to = end_date) %>%
+    rename(!!label := price)
+}
+
+```
+
+```{r}
+#Download only monthly indicators
+df_list <- list(
+  Unemployment = get_symbols("UNRATE", "Unemployment"),
+  CPI = get_symbols("CPIAUCSL", "CPI"),
+  InterestRate = get_symbols("FEDFUNDS", "InterestRate"),
+  Yield10 = get_symbols("GS10", "Yield10"),
+  Yield2 = get_symbols("GS2", "Yield2"),
+  Recession = get_symbols("USREC", "Recession")
+)
+
+```
+
+```{r}
+#Join all data
+df <- reduce(df_list, full_join, by = "date") %>%
+  arrange(date)%>%
+  filter(!is.na(Recession))  
+  
+
+```
+
+```{r}
+#Feature Engineering
+df <- df %>%
+  mutate(
+    YieldSpread = Yield10 - Yield2,
+    Unemployment_Lag = lag(Unemployment, 1),
+    CPI_Lag = lag(CPI, 1),
+    InterestRate_Lag = lag(InterestRate, 1),
+    YieldSpread_Lag = lag(YieldSpread, 1),
+    Recession_Lead3 = lead(Recession, 3),
+    Recession_Lead3 = as.factor(ifelse(Recession_Lead3 == 1, "Yes", "No"))
+  ) %>%
+  drop_na(Unemployment_Lag, CPI_Lag, InterestRate_Lag, YieldSpread_Lag, Recession_Lead3)
+
+#EDA: Summary statistics
+summary(df)
+
+#Time-series of key indicators
+df_long <- df %>%
+  select(date, Unemployment, CPI, InterestRate, YieldSpread) %>%
+  pivot_longer(-date, names_to = "Variable", values_to = "Value")
+
+ggplot(df_long, aes(x = date, y = Value, color = Variable)) +
+  geom_line() +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 1) +
+  labs(title = "Monthly Economic Indicators Over Time") +
+  theme_minimal()
+
+# Class balance plot
+ggplot(df, aes(x = Recession)) +
+  geom_bar(fill = "steelblue") +
+  labs(title = "Class Distribution: Recession vs No Recession") +
+  theme_minimal()
+
+#Correlation matrix
+df_corr <- df %>%
+  select(Unemployment_Lag, CPI_Lag, InterestRate_Lag, YieldSpread_Lag) %>%
+  cor(use = "complete.obs")
+
+corrplot::corrplot(df_corr, method = "circle", type = "upper", tl.cex = 0.8)
+
+```
+
+```{r}
+#Missing value summary
+cat("Missing values per column:\n")
+print(sapply(df, function(x) sum(is.na(x))))
+
+#Confirm dataset
+cat("Number of rows:", nrow(df), "\n")
+print(table(df$Recession))
+```
+
+```{r}
+set.seed(42)
+split_index <- createDataPartition(df$Recession_Lead3, p = 0.8, list = FALSE)
+train_data <- df[split_index, ]
+test_data  <- df[-split_index, ]
+
+cat("Train class distribution:\n")
+print(table(train_data$Recession_Lead3))
+
+```
+
+```{r}
+## Logistic Regression
+log_model <- glm(Recession_Lead3 ~ Unemployment_Lag + CPI_Lag + 
+                   InterestRate_Lag + YieldSpread_Lag,
+                 data = train_data, family = binomial)
+
+log_probs <- predict(log_model, test_data, type = "response")
+log_preds <- ifelse(log_probs > 0.5, "Yes", "No") %>% factor(levels = c("No", "Yes"))
+log_cm <- confusionMatrix(log_preds, test_data$Recession_Lead3)
+
+```
+
+```{r}
+## Random Forest
+rf_model <- randomForest(Recession_Lead3 ~ Unemployment_Lag + CPI_Lag + 
+                           InterestRate_Lag + YieldSpread_Lag,
+                         data = train_data, ntree = 500, importance = TRUE)
+
+rf_probs <- predict(rf_model, test_data, type = "prob")[, "Yes"]
+rf_preds <- ifelse(rf_probs > 0.5, "Yes", "No") %>% factor(levels = c("No", "Yes"))
+rf_cm <- confusionMatrix(rf_preds, test_data$Recession_Lead3)
+
+```
+
+```{r}
+# XGBoost
+
+train_matrix <- model.matrix(Recession_Lead3 ~ Unemployment_Lag + CPI_Lag +
+                             InterestRate_Lag + YieldSpread_Lag - 1, data = train_data)
+test_matrix  <- model.matrix(Recession_Lead3 ~ Unemployment_Lag + CPI_Lag +
+                             InterestRate_Lag + YieldSpread_Lag - 1, data = test_data)
+train_label <- ifelse(train_data$Recession_Lead3 == "Yes", 1, 0)
+test_label  <- ifelse(test_data$Recession_Lead3 == "Yes", 1, 0)
+
+xgb_model <- xgboost(data = train_matrix, label = train_label,
+                     nrounds = 100, objective = "binary:logistic", verbose = 0)
+
+xgb_probs <- predict(xgb_model, test_matrix)
+xgb_preds <- ifelse(xgb_probs > 0.5, "Yes", "No") %>% factor(levels = c("No", "Yes"))
+xgb_cm <- confusionMatrix(xgb_preds, test_data$Recession_Lead3)
+
+```
+
+
+```{r}
+# ROC curves
+roc_log <- roc(test_data$Recession_Lead3, log_probs)
+roc_rf  <- roc(test_data$Recession_Lead3, rf_probs)
+roc_xgb <- roc(test_data$Recession_Lead3, xgb_probs)
+
+# Plot all ROC curves
+plot(roc_log, col = "blue", main = "ROC Curve Comparison")
+lines(roc_rf, col = "green")
+lines(roc_xgb, col = "red")
+legend("bottomright", legend = c("Logistic", "Random Forest", "XGBoost"),
+       col = c("blue", "green", "red"), lwd = 2)
+
+# Print confusion matrices
+cat("Logistic Regression Confusion Matrix:\n")
+print(log_cm)
+
+cat("\nRandom Forest Confusion Matrix:\n")
+print(rf_cm)
+
+cat("\nXGBoost Confusion Matrix:\n")
+print(xgb_cm)
+
+# Get AUC for Logistic Regression
+auc_log <- auc(roc_log)
+cat("Logistic Regression AUC:", round(auc_log, 4), "\n")
+
+# Get AUC for Random Forest
+auc_rf <- auc(roc_rf)
+cat("Random Forest AUC:", round(auc_rf, 4), "\n")
+
+
+```
+Variable importance plots:
+```{r}
+# Logistic Regression Coefficients
+log_importance <- summary(log_model)$coefficients
+log_importance_df <- data.frame(
+  Variable = rownames(log_importance),
+  Importance = abs(log_importance[, "Estimate"])
+) %>%
+  filter(Variable != "(Intercept)") %>%
+  arrange(desc(Importance))
+
+ggplot(log_importance_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "skyblue") +
+  coord_flip() +
+  labs(title = "Logistic Regression Variable Importance", x = "Variable", y = "Absolute Coefficient") +
+  theme_minimal()
+```
+
+```{r}
+varImpPlot(rf_model, main = "Random Forest Variable Importance")
+
+```
+
+```{r}
+# XGBoost Variable Importance
+xgb.importance_matrix <- xgb.importance(model = xgb_model)
+xgb.plot.importance(xgb.importance_matrix, top_n = 10, main = "XGBoost Feature Importance")
+
+```
+
+
+```{r}
+#Logistic Regression: Recession Probability Over Time
+log_plot_data <- test_data %>%
+  mutate(Date = date,
+         Log_Prob = log_probs,
+         ActualRecession = Recession_Lead3)
+
+log_recession_plot <- ggplot(log_plot_data, aes(x = Date)) +
+  geom_line(aes(y = Log_Prob), color = "darkorange", linewidth = 1) +
+  geom_ribbon(aes(ymin = 0, ymax = as.numeric(ActualRecession) - 1),
+              fill = "red", alpha = 0.2) +
+  labs(title = "Logistic Regression Predicted Recession Probability",
+       y = "Probability of Recession", x = "Date") +
+  theme_minimal()
+
+print(log_recession_plot)
+
+```
+
+```{r}
+#Random Forest Predicted Probabilities Over Time
+plot_data <- test_data %>%
+  mutate(Date = date,
+         RF_Prob = rf_probs,
+         ActualRecession = Recession_Lead3)
+
+recession_plot <- ggplot(plot_data, aes(x = Date)) +
+  geom_line(aes(y = RF_Prob), color = "blue", linewidth = 1) +
+  geom_ribbon(aes(ymin = 0, ymax = as.numeric(ActualRecession) - 1),
+              fill = "red", alpha = 0.2) +
+  labs(title = "Random Forest Predicted Recession Probability",
+       y = "Probability of Recession", x = "Date") +
+  theme_minimal()
+
+print(recession_plot)
+
+```
+
+```{r}
+#XGBoost Recession Probability Over Time
+xgb_plot_data <- test_data %>%
+  mutate(Date = date,
+         XGB_Prob = xgb_probs,
+         ActualRecession = Recession_Lead3)
+
+xgb_recession_plot <- ggplot(xgb_plot_data, aes(x = Date)) +
+  geom_line(aes(y = XGB_Prob), color = "darkgreen", linewidth = 1) +
+  geom_ribbon(aes(ymin = 0, ymax = as.numeric(ActualRecession) - 1),
+              fill = "red", alpha = 0.2) +
+  labs(title = "XGBoost Predicted Recession Probability",
+       y = "Probability of Recession", x = "Date") +
+  theme_minimal()
+
+print(xgb_recession_plot)
+
+```
+
+Tuning XGBboost model:
+```{r}
+# XGBoost with Class Imbalance Correction using scale_pos_weight
+
+# Calculate class imbalance ratio
+neg_cases <- sum(train_label == 0)  # No recession cases
+pos_cases <- sum(train_label == 1)  # Yes recession cases
+scale_pos_weight <- neg_cases / pos_cases
+
+cat("Class distribution:\n")
+cat("No recession (0):", neg_cases, "\n")
+cat("Yes recession (1):", pos_cases, "\n")
+cat("Imbalance ratio (scale_pos_weight):", scale_pos_weight, "\n\n")
+
+# Train XGBoost with class weight adjustment
+xgb_balanced_model <- xgboost(
+  data = train_matrix, 
+  label = train_label,
+  nrounds = 100, 
+  objective = "binary:logistic", 
+  scale_pos_weight = scale_pos_weight, 
+  verbose = 0
+)
+
+# Make predictions
+xgb_balanced_probs <- predict(xgb_balanced_model, test_matrix)
+xgb_balanced_preds <- ifelse(xgb_balanced_probs > 0.5, "Yes", "No") %>% 
+  factor(levels = c("No", "Yes"))
+
+# Confusion matrix
+xgb_balanced_cm <- confusionMatrix(xgb_balanced_preds, test_data$Recession_Lead3)
+cat("XGBoost with scale_pos_weight Results:\n")
+print(xgb_balanced_cm)
+
+# Compare with original model
+cat("\n COMPARISON \n")
+cat("Original Model - Recession Recall (Specificity):", round(xgb_cm$byClass["Specificity"], 4), "\n")
+cat("Balanced Model - Recession Recall (Specificity):", round(xgb_balanced_cm$byClass["Specificity"], 4), "\n")
+cat("Original Model - Overall Accuracy:", round(xgb_cm$overall["Accuracy"], 4), "\n")
+cat("Balanced Model - Overall Accuracy:", round(xgb_balanced_cm$overall["Accuracy"], 4), "\n")
+```
+
+```{r}
+# Define parameter grid
+param_grid <- expand.grid(
+  nrounds = c(50, 100, 150, 200),
+  max_depth = c(3, 4, 5, 6),
+  eta = c(0.01, 0.05, 0.1, 0.2),
+  gamma = c(0, 0.1, 0.5, 1),
+  subsample = c(0.8, 0.9, 1.0),
+  colsample_bytree = c(0.8, 0.9, 1.0),
+  min_child_weight = c(1, 3, 5)
+)
+
+# Sample grid for faster tuning
+set.seed(123)
+param_grid_sample <- param_grid[sample(nrow(param_grid), min(100, nrow(param_grid))), ]
+
+best_auc <- 0
+best_params <- NULL
+best_model <- NULL
+
+cat("Testing", nrow(param_grid_sample), "parameter combinations...\n")
+
+# Grid search
+for(i in 1:nrow(param_grid_sample)) {
+  params <- param_grid_sample[i, ]
+  
+  model <- xgboost(
+    data = train_matrix,
+    label = train_label,
+    nrounds = params$nrounds,
+    max_depth = params$max_depth,
+    eta = params$eta,
+    gamma = params$gamma,
+    subsample = params$subsample,
+    colsample_bytree = params$colsample_bytree,
+    min_child_weight = params$min_child_weight,
+    scale_pos_weight = scale_pos_weight,
+    objective = "binary:logistic",
+    verbose = 0
+  )
+  
+  pred_probs <- predict(model, test_matrix)
+  auc_score <- auc(roc(test_data$Recession_Lead3, pred_probs, quiet = TRUE))
+  
+  if(auc_score > best_auc) {
+    best_auc <- auc_score
+    best_params <- params
+    best_model <- model
+  }
+
+  if(i %% 20 == 0) cat("Completed", i, "combinations. Best AUC so far:", round(best_auc, 4), "\n")
+}
+
+cat("\nHyperparameter tuning completed!\n")
+cat("Best Parameters Found:\n")
+print(best_params)
+cat("Best AUC:", round(best_auc, 4), "\n")
+
+# Predict with best model using 0.5 threshold
+xgb_final_probs <- predict(best_model, test_matrix)
+xgb_final_preds <- ifelse(xgb_final_probs > 0.5, "Yes", "No") %>% factor(levels = c("No", "Yes"))
+xgb_final_cm <- confusionMatrix(xgb_final_preds, test_data$Recession_Lead3)
+
+cat("\nFinal Tuned Balanced XGBoost Results (0.5 threshold):\n")
+print(xgb_final_cm)
+
+
+```
+
+```{r}
+# Find optimal threshold
+library(pROC)
+roc_final <- roc(test_data$Recession_Lead3, xgb_final_probs)
+optimal_threshold <- coords(roc_final, "best", ret = "threshold")
+
+cat("Optimal threshold:", optimal_threshold$threshold, "\n")
+
+# Apply optimal threshold
+xgb_optimal_preds <- ifelse(xgb_final_probs > optimal_threshold$threshold, "Yes", "No") %>% 
+  factor(levels = c("No", "Yes"))
+xgb_optimal_cm <- confusionMatrix(xgb_optimal_preds, test_data$Recession_Lead3)
+
+cat("\nOptimal Threshold Results:\n")
+print(xgb_optimal_cm)
+
+# Final comparison summary
+cat("\n MODEL COMPARISON \n")
+cat("Original XGBoost:\n")
+cat("  Accuracy:", round(xgb_cm$overall["Accuracy"], 4), "\n")
+cat("  Recession Recall (Specificity):", round(xgb_cm$byClass["Specificity"], 4), "\n")
+
+cat("\nBalanced XGBoost (scale_pos_weight only):\n")
+cat("  Accuracy:", round(xgb_balanced_cm$overall["Accuracy"], 4), "\n")
+cat("  Recession Recall (Specificity):", round(xgb_balanced_cm$byClass["Specificity"], 4), "\n")
+
+cat("\nFinal Tuned Balanced XGBoost (0.5 threshold):\n")
+cat("  Accuracy:", round(xgb_final_cm$overall["Accuracy"], 4), "\n")
+cat("  Recession Recall (Specificity):", round(xgb_final_cm$byClass["Specificity"], 4), "\n")
+cat("  AUC:", round(best_auc, 4), "\n")
+
+cat("\nFinal Tuned Balanced XGBoost (optimal threshold):\n")
+cat("  Accuracy:", round(xgb_optimal_cm$overall["Accuracy"], 4), "\n")
+cat("  Recession Recall (Specificity):", round(xgb_optimal_cm$byClass["Specificity"], 4), "\n")
+cat("  Threshold used:", round(optimal_threshold$threshold, 4), "\n")
+cat("  AUC:", round(best_auc, 4), "\n")
+
+
+```
+
+Real-Time Recession Prediction and Visualization:
+```{r, results='show', echo=TRUE}
+# Prepare latest available input features
+latest_data <- df %>%
+  arrange(desc(date)) %>%
+  head(1) %>%
+  select(Unemployment_Lag, CPI_Lag, InterestRate_Lag, YieldSpread_Lag)
+
+# Convert to matrix format for XGBoost prediction
+latest_matrix <- model.matrix(~ Unemployment_Lag + CPI_Lag + 
+                                InterestRate_Lag + YieldSpread_Lag - 1, 
+                              data = latest_data)
+
+# Predict recession probability using best tuned XGBoost model
+latest_prob <- predict(best_model, latest_matrix)
+
+# Apply optimal threshold to classify
+latest_pred <- ifelse(latest_prob > optimal_threshold$threshold, "Yes", "No")
+
+# Print prediction results
+cat(" LATEST ECONOMIC OUTLOOK \n")
+cat("Date of latest data:", as.character(df$date[nrow(df)]), "\n")
+cat("Predicted probability of recession (3 months ahead):", round(latest_prob, 4), "\n")
+cat("Recession expected?", latest_pred, "(based on threshold =", round(optimal_threshold$threshold, 4), ")\n")
+
+# Create visualization of predicted probabilities vs actual recessions
+df_prediction_plot <- test_data %>%
+  mutate(XGB_Prob = xgb_final_probs,
+         PredictedRecession = ifelse(xgb_final_probs > optimal_threshold$threshold, 1, 0))
+
+ggplot(df_prediction_plot, aes(x = date)) +
+  geom_line(aes(y = XGB_Prob), color = "darkgreen", linewidth = 1) +
+  geom_ribbon(aes(ymin = 0, ymax = PredictedRecession), fill = "blue", alpha = 0.2) +
+  geom_ribbon(aes(ymin = 0, ymax = as.numeric(Recession_Lead3) - 1), fill = "red", alpha = 0.2) +
+  labs(title = "Predicted Recession Risk vs Actual Recessions",
+       y = "Predicted Probability of Recession", x = "Date") +
+  theme_minimal()
+tail(
+  df_prediction_plot %>%
+    select(date, XGB_Prob, Recession_Lead3, PredictedRecession),
+  6
+)
+```
+6 month forecasting:
+```{r}
+#Create 6 month target and features
+df_6mo <- df %>%
+  mutate(
+    Recession_Lead6 = lead(Recession, 6),
+    Recession_Lead6 = as.factor(ifelse(Recession_Lead6 == 1, "Yes", "No"))
+  ) %>%
+  drop_na(Unemployment_Lag, CPI_Lag, InterestRate_Lag, YieldSpread_Lag, Recession_Lead6)
+
+#Split into training and test sets
+set.seed(42)
+split_index_6mo <- createDataPartition(df_6mo$Recession_Lead6, p = 0.8, list = FALSE)
+train_6mo <- df_6mo[split_index_6mo, ]
+test_6mo  <- df_6mo[-split_index_6mo, ]
+
+#Prepare matrices and labels
+train_matrix_6mo <- model.matrix(Recession_Lead6 ~ Unemployment_Lag + CPI_Lag +
+                                  InterestRate_Lag + YieldSpread_Lag - 1, data = train_6mo)
+test_matrix_6mo  <- model.matrix(Recession_Lead6 ~ Unemployment_Lag + CPI_Lag +
+                                  InterestRate_Lag + YieldSpread_Lag - 1, data = test_6mo)
+train_label_6mo <- ifelse(train_6mo$Recession_Lead6 == "Yes", 1, 0)
+test_label_6mo  <- ifelse(test_6mo$Recession_Lead6 == "Yes", 1, 0)
+
+#Adjust for class imbalance
+scale_pos_weight_6mo <- sum(train_label_6mo == 0) / sum(train_label_6mo == 1)
+
+#Train with best parameters
+xgb_6mo <- xgboost(
+  data = train_matrix_6mo,
+  label = train_label_6mo,
+  nrounds = best_params$nrounds,
+  max_depth = best_params$max_depth,
+  eta = best_params$eta,
+  gamma = best_params$gamma,
+  subsample = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  min_child_weight = best_params$min_child_weight,
+  scale_pos_weight = scale_pos_weight_6mo,
+  objective = "binary:logistic",
+  verbose = 0
+)
+
+#Predict and evaluate
+xgb_probs_6mo <- predict(xgb_6mo, test_matrix_6mo)
+roc_6mo <- roc(test_6mo$Recession_Lead6, xgb_probs_6mo)
+optimal_threshold_6mo <- coords(roc_6mo, "best", ret = "threshold")
+
+xgb_preds_6mo <- ifelse(xgb_probs_6mo > optimal_threshold_6mo$threshold, "Yes", "No") %>%
+  factor(levels = c("No", "Yes"))
+xgb_cm_6mo <- confusionMatrix(xgb_preds_6mo, test_6mo$Recession_Lead6)
+
+cat("\n 6-MONTH XGBOOST RESULTS \n")
+print(xgb_cm_6mo)
+cat("Optimal threshold:", round(optimal_threshold_6mo$threshold, 4), "\n")
+cat("AUC:", round(auc(roc_6mo), 4), "\n")
+
+#Visualization
+df_pred_6mo <- test_6mo %>%
+  mutate(XGB_Prob_6mo = xgb_probs_6mo,
+         PredictedRecession_6mo = ifelse(xgb_probs_6mo > optimal_threshold_6mo$threshold, 1, 0))
+
+ggplot(df_pred_6mo, aes(x = date)) +
+  geom_line(aes(y = XGB_Prob_6mo), color = "purple", linewidth = 1) +
+  geom_ribbon(aes(ymin = 0, ymax = PredictedRecession_6mo), fill = "blue", alpha = 0.2) +
+  geom_ribbon(aes(ymin = 0, ymax = as.numeric(Recession_Lead6) - 1), fill = "red", alpha = 0.2) +
+  labs(title = "6-Month Predicted Recession Risk vs Actual Recession",
+       y = "Predicted Probability", x = "Date") +
+  theme_minimal()
+
+
+```
+6 month prediction:
+```{r}
+latest_data_6mo <- df %>%
+  arrange(desc(date)) %>%
+  head(1) %>%
+  select(Unemployment_Lag, CPI_Lag, InterestRate_Lag, YieldSpread_Lag)
+
+latest_matrix_6mo <- model.matrix(~ Unemployment_Lag + CPI_Lag + 
+                                    InterestRate_Lag + YieldSpread_Lag - 1, 
+                                  data = latest_data_6mo)
+
+latest_prob_6mo <- predict(xgb_6mo, latest_matrix_6mo)
+latest_pred_6mo <- ifelse(latest_prob_6mo > optimal_threshold_6mo$threshold, "Yes", "No")
+
+cat(" REAL-TIME 6-MONTH FORECAST \n")
+cat("Latest Data Date:", as.character(df$date[nrow(df)]), "\n")
+cat("Predicted probability of recession (6 months ahead):", round(latest_prob_6mo, 4), "\n")
+cat("Recession expected?", latest_pred_6mo, "(Threshold =", round(optimal_threshold_6mo$threshold, 4), ")\n")
+
+```
+
+```{r}
+# Create data frame for plotting
+plot_data_6mo <- data.frame(
+  Label = "6-Month Recession Probability",
+  Probability = latest_prob_6mo,
+  Threshold = optimal_threshold_6mo$threshold
+)
+
+# Bar plot with threshold line
+ggplot(plot_data_6mo, aes(x = Label, y = Probability)) +
+  geom_col(fill = ifelse(latest_pred_6mo == "Yes", "red", "steelblue"), width = 0.5) +
+  geom_hline(yintercept = plot_data_6mo$Threshold, color = "darkgreen", linetype = "dashed", linewidth = 1) +
+  annotate("text", x = 1, y = plot_data_6mo$Threshold + 0.05,
+           label = paste("Threshold =", round(plot_data_6mo$Threshold, 2)),
+           color = "darkgreen", size = 4, hjust = 0.5) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Real-Time 6-Month Recession Forecast",
+    subtitle = paste("Prediction Date:", as.character(df$date[nrow(df)])),
+    y = "Predicted Probability",
+    x = ""
+  ) +
+  theme_minimal(base_size = 13)
+
+
+```
+```{r}
+# --- ROC + AUC for all models ---
+
+# Logistic, RF, Original XGB (already computed earlier)
+# roc_log, roc_rf, roc_xgb
+# Weighted XGB
+roc_xgb_bal <- roc(test_data$Recession_Lead3, xgb_balanced_probs)
+
+# Final tuned XGB
+roc_final <- roc(test_data$Recession_Lead3, xgb_final_probs)
+
+# 6-month tuned XGB (already computed as roc_6mo)
+# roc_6mo <- roc(test_6mo$Recession_Lead6, xgb_probs_6mo)
+
+# Print AUCs
+cat("=== 3-MONTH FORECAST AUCs ===\n")
+cat("Logistic Regression:", round(auc(roc_log), 4), "\n")
+cat("Random Forest:", round(auc(roc_rf), 4), "\n")
+cat("XGBoost Original:", round(auc(roc_xgb), 4), "\n")
+cat("XGBoost Weighted:", round(auc(roc_xgb_bal), 4), "\n")
+cat("XGBoost Final Tuned:", round(auc(roc_final), 4), "\n\n")
+
+cat("=== 6-MONTH FORECAST AUC ===\n")
+cat("XGBoost Final Tuned:", round(auc(roc_6mo), 4), "\n\n")
+
+# Plot all 3-month ROCs
+plot(roc_log, col = "blue", main = "ROC Curves – 3-Month and 6-Month Forecasts")
+lines(roc_rf, col = "green")
+lines(roc_xgb, col = "red")
+lines(roc_xgb_bal, col = "purple")
+lines(roc_final, col = "black")
+
+legend("bottomright",
+       legend = c(
+         paste0("Logistic (AUC=", round(auc(roc_log), 3), ")"),
+         paste0("Random Forest (AUC=", round(auc(roc_rf), 3), ")"),
+         paste0("XGB Original (AUC=", round(auc(roc_xgb), 3), ")"),
+         paste0("XGB Weighted (AUC=", round(auc(roc_xgb_bal), 3), ")"),
+         paste0("XGB Tuned (AUC=", round(auc(roc_final), 3), ")")
+       ),
+       col = c("blue","green","red","purple","black"), lwd = 2, cex = 0.8)
+
+# Overlay 6-month ROC on the same chart for comparison
+lines(roc_6mo, col = "darkmagenta", lty = 2, lwd = 2)
+legend("bottomleft",
+       legend = paste0("6-Month XGB Tuned (AUC=", round(auc(roc_6mo), 3), ")"),
+       col = "darkmagenta", lwd = 2, lty = 2, cex = 0.8)
+
+```
+
