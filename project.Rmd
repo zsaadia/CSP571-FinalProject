@@ -576,6 +576,11 @@ plot_data_6mo <- data.frame(
   Threshold = optimal_threshold_6mo$threshold
 )
 
+cat("\n6-MONTH TEST-SET CONFUSION MATRIX\n")
+test_preds_6mo <- ifelse(xgb_probs_6mo > optimal_threshold_6mo$threshold, "Yes", "No") %>%
+  factor(levels = c("No","Yes"))
+print(confusionMatrix(test_preds_6mo, test_6mo$Recession_Lead6))
+
 # Bar plot with threshold line
 ggplot(plot_data_6mo, aes(x = Label, y = Probability)) +
   geom_col(fill = ifelse(latest_pred_6mo == "Yes", "red", "steelblue"), width = 0.5) +
