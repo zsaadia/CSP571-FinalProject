@@ -189,6 +189,8 @@ cat("Logistic Regression AUC:", round(auc_log, 4), "\n")
 auc_rf <- auc(roc_rf)
 cat("Random Forest AUC:", round(auc_rf, 4), "\n")
 
+auc_xgb <- auc(roc_xgb)
+cat("XGBoost AUC:", round(auc_xgb, 4), "\n")
 
 ```
 Variable importance plots:
