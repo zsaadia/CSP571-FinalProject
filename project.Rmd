@@ -627,4 +627,5 @@ legend("bottomleft",
        col = "darkmagenta", lwd = 2, lty = 2, cex = 0.8)
 
 ```
-
+Citations: OpenAI. (2025)
+This work was completed with assistance from ChatGPT
